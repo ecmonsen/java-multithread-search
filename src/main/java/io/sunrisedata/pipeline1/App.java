@@ -74,7 +74,7 @@ public class App {
         double elapsedSeconds = (endTime - startTime) / 1000000000.0;
 
         // searchTerm,count,elapsedSeconds,exceptionCount,numCpuThreads,numIoThreads,failureRate
-        System.out.format("%s,%d,%d,%f,%f,%d%n",
+        System.out.format("%s,%d,%f,%d,%d,%d,%f%n",
                 searchTerm,
                 result.getCount(),
                 elapsedSeconds,
@@ -215,7 +215,6 @@ class Result {
     }
 }
 
-
 class ParallelSearcher {
     private static final Logger logger = Logger.getLogger("s3test)");
 
@@ -248,7 +247,7 @@ class ParallelSearcher {
     // For limiting use of network bandwidth
     private final Semaphore inMemoryFileSemaphore;
     // For communication between the thread pools
-    private final ArrayBlockingQueue<byte[]> inMemoryFileQueue;
+    private final ArrayBlockingQueue<SearchParams> inMemoryFileQueue;
 
     public ParallelSearcher(
             Downloader downloader,
@@ -295,11 +294,10 @@ class ParallelSearcher {
         for (int t = 0; t < numCpuThreads; t++) {
             cpuExecutor.submit(
                     () -> {
-                        int threadMatches = 0;
                         while (true) {
                             try {
-                                byte[] indexData = inMemoryFileQueue.poll(pollTimeout, TimeUnit.MILLISECONDS);
-                                if (indexData == null) {
+                                SearchParams searchParams = inMemoryFileQueue.poll(pollTimeout, TimeUnit.MILLISECONDS);
+                                if (searchParams == null) {
                                     // Either we are waiting, or we are done.
                                     if (this.indexesQueued.get() >= endIndex) {
                                         // we are done
@@ -307,10 +305,10 @@ class ParallelSearcher {
                                     }
                                     logger.fine("Polling timed out while waiting for new indexes");
                                 } else {
-
-                                    threadMatches += this.textSearcher.countMatches(indexData);
+                                    int matches = this.textSearcher.countMatches(searchParams.data);
                                     // All done - submit my results
-                                    this.addToCount(threadMatches);
+//                                    System.out.printf("Found  %d matches in %d%n", matches, searchParams.index);
+                                    this.addToCount(matches);
 
                                     inMemoryFileSemaphore.release();
                                 }
@@ -355,7 +353,7 @@ class ParallelSearcher {
 
                     byte[] indexData = downloader.download(index);
                     indexesQueued.incrementAndGet();
-                    inMemoryFileQueue.add(indexData);
+                    inMemoryFileQueue.add(new SearchParams(index, indexData));
                     return null;
                 } catch (IOException | InterruptedException e) {
                     inMemoryFileSemaphore.release();
@@ -365,6 +363,15 @@ class ParallelSearcher {
             }
 
             return null;
+        }
+    }
+    class SearchParams {
+        public final int index;
+        public final byte[] data;
+
+        public SearchParams(int index, byte[] data) {
+            this.index = index;
+            this.data = data;
         }
     }
 }
