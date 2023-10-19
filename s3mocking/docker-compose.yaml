@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  s3ninja:
+    build: .
+    environment:
+      - "NETWORK_RATE=${NETWORK_RATE:-1024mbit}"
+      - "NETWORK_LATENCY=${NETWORK_LATENCY:-500ms}"
+      - "NETWORK_BURST=${NETWORK_BURST:-10k}"
+    volumes:
+      - data-volume:/home/sirius/data
+    cap_add:
+      - NET_ADMIN
+    ports:
+      - 9444:9000
+
+volumes:
+  data-volume:

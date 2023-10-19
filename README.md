@@ -1,27 +1,32 @@
 # Multithreaded file search
 
 This is a small Java program that downloads files from S3 and searches them for a particular word, in parallel. 
-I implemented something similar during a job interview. This version uses standard and open source libraries.
+I implemented something similar during a job interview. This version uses standard and open source libraries and a mock 
+S3 server.
+
+The provided Docker container in `s3mocking` artificially throttles the network so that I can benchmark the program 
+with different numbers of I/O threads.
 
 ## Prerequisites
 - Java 1.8+ (I used the Amazon Coretto JDK 11)
 - Apache Maven
-- Optional: Docker to run an S3 simulator
+- Optional: Docker to run the S3 simulator
 - Optional: Python 3.X to generate a word list
+- Optional: gnuplot for benchmarking graphs
 
 ## Setup
 
 ### Mock S3
 I tested this with [S3 Ninja](https://s3ninja.net/).
 
-1. Run `docker run -p 9444:9000 scireum/s3-ninja`
+1. In the `s3mocking` directory, run `docker-compose up -d`.
 2. Go to [http://localhost:9444](http://localhost:9444) in your browser.
 3. Copy the key id and secret key into your `~/.aws/credentials` file under a new profile, say `[ninja]`.
 4. Use this command to create a fake bucket: `aws --endpoint-url http://localhost:9444 --profile ninja s3 mb s3://BUCKET`
 
 ### Wordlist
 
-A wordlist is provided, but if you wish to regenerate it, you can do so by tokenizing the complete works of shakespeare.
+A wordlist is provided, but if you wish to regenerate it, you can do so by tokenizing the complete works of Shakespeare.
 
 1. Create a Python virtual environment
 2. Activate it
@@ -64,6 +69,5 @@ Output is in CSV format. Run `./search -header` to see the column headers.
 
 Coming soon: Run repeatedly with different `-cputhreads`, `-iothreads` and so on.
 
-Coming soon: Artificial network throttling and artificial CPU usage inflation.
+Coming soon: Artificial CPU usage inflation.
 
-Coming soon: gnuplot commands to plot your benchmarks CSV.
