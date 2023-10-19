@@ -4,11 +4,9 @@ import org.apache.commons.cli.*;
 import software.amazon.awssdk.services.s3.S3Client;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.logging.ConsoleHandler;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import java.util.logging.*;
 
 /**
  * A multi-threaded implementation of searching for a string in multiple S3 objects.
@@ -18,8 +16,8 @@ public class App {
     private static final int DEFAULT_CPU_THREAD_COUNT = 5;
     private static final double DEFAULT_NETWORK_FAILURE_RATE = 0.0025;
     private static final int DEFAULT_MAX_FILE_SIZE = 1024 * 1024; //1 MB
-    private static final int DEFAULT_FILE_COUNT = 10;
-    private static final int DEFAULT_MEM = 5;
+    private static final int DEFAULT_FILE_COUNT = 100;
+    private static final int DEFAULT_FILES_ALLOWED_IN_MEMORY = 5;
     private static final int DEFAULT_MAX_FILE_RETRIES = 4;
     private static final Logger logger = Logger.getLogger("s3test");
 
@@ -27,16 +25,22 @@ public class App {
 
         // Set up logging
         System.setProperty("java.util.logging.SimpleFormatter.format", "%1$tF %1$tT %5$s%6$s%n");
-        logger.setLevel(Level.INFO);
-        logger.addHandler(new ConsoleHandler());
+        ThreadNameSimpleFormatter formatter = new ThreadNameSimpleFormatter();
 
         // Get command line options
         CommandLine cmd = getOptions(args);
+        Level level = Level.parse(cmd.hasOption("ll") ? cmd.getOptionValue("ll") : "SEVERE");
+        logger.setLevel(level);
+
+        logger.setUseParentHandlers(false);
+        ConsoleHandler handler = new ConsoleHandler();
+        handler.setFormatter(formatter);
+        logger.addHandler(handler);
 
         String searchTerm = cmd.getArgList().isEmpty() ? "hamlet" : cmd.getArgList().get(0);
         int numCpuThreads = getNumericOption(cmd, "cputhreads", DEFAULT_CPU_THREAD_COUNT).intValue();
         int numIoThreads = getNumericOption(cmd, "iothreads", DEFAULT_IO_THREAD_COUNT).intValue();
-        int maxInMemoryFileCount = getNumericOption(cmd, "mem", DEFAULT_MEM).intValue();
+        int maxInMemoryFileCount = getNumericOption(cmd, "mem", DEFAULT_FILES_ALLOWED_IN_MEMORY).intValue();
         double failureRate = getNumericOption(cmd, "networkfailure", DEFAULT_NETWORK_FAILURE_RATE).doubleValue();
 
         // Set up resources
@@ -58,7 +62,6 @@ public class App {
         ParallelSearcher searcher = new ParallelSearcher(
                 downloader,
                 textSearcher,
-                0,
                 DEFAULT_FILE_COUNT,
                 numCpuThreads,
                 numIoThreads,
@@ -69,7 +72,9 @@ public class App {
 
         // Measure total clock time
         double startTime = System.nanoTime();
+
         Result result = searcher.search();
+
         double endTime = System.nanoTime();
         double elapsedSeconds = (endTime - startTime) / 1000000000.0;
 
@@ -139,6 +144,11 @@ public class App {
                 .hasArg()
                 .type(Number.class)
                 .build());
+        options.addOption(Option.builder()
+                .option("ll")
+                .desc("Log level")
+                .hasArg()
+                .build());
         CommandLineParser parser = new DefaultParser();
         try {
             CommandLine cmd = parser.parse(options, args);
@@ -188,12 +198,6 @@ public class App {
 
 }
 
-class NeedHelpException extends Exception {
-    NeedHelpException() {
-
-    }
-}
-
 /**
  * Results of a search.
  */
@@ -216,48 +220,37 @@ class Result {
 }
 
 class ParallelSearcher {
-    private static final Logger logger = Logger.getLogger("s3test)");
+    private final Logger logger;
 
 
     private final Searcher textSearcher;
     private final int endIndex;
     private final int numCpuThreads;
 
-    private final AtomicInteger indexesQueued;
     private final int downloadRetries;
-    private final int startIndex;
     private final Downloader downloader;
     private final ExecutorService cpuExecutor;
     private final ExecutorService ioExecutor;
 
-    private int count;
-
     private int exceptionCount;
-    // polling timeout in milliseconds
-    private final long pollTimeout = 100;
-
-    synchronized void addToCount(int v) {
-        count += v;
-    }
 
     synchronized void addToExceptionCount(int v) {
         exceptionCount += v;
     }
 
-    // For limiting use of network bandwidth
+    // For limiting number of files stored in memory
     private final Semaphore inMemoryFileSemaphore;
-    // For communication between the thread pools
-    private final ArrayBlockingQueue<SearchParams> inMemoryFileQueue;
 
     public ParallelSearcher(
             Downloader downloader,
             Searcher textSearcher,
-            int startIndex,
             int endIndex,
             int numCpuThreads,
             int numIoThreads,
             int downloadRetries,
             int maxInMemoryFileCount) {
+        logger = Logger.getLogger("s3test.ParallelSearcher)");
+        logger.setUseParentHandlers(true);
         this.cpuExecutor = Executors.newFixedThreadPool(numCpuThreads);
         this.ioExecutor = Executors.newFixedThreadPool(numIoThreads);
 
@@ -265,15 +258,11 @@ class ParallelSearcher {
         this.endIndex = endIndex;
         this.numCpuThreads = numCpuThreads;
         this.downloader = downloader;
-        this.indexesQueued = new AtomicInteger(startIndex);
 
         this.downloadRetries = downloadRetries;
-        this.startIndex = startIndex;
         // manages load on memory by only downloading so many files at once.
         this.inMemoryFileSemaphore = new Semaphore(maxInMemoryFileCount, true);
 
-        // capacity should be based on available memory
-        this.inMemoryFileQueue = new ArrayBlockingQueue<>(maxInMemoryFileCount);
     }
 
     /**
@@ -287,84 +276,54 @@ class ParallelSearcher {
 
         // TODO consider what to do when endIndex is very large - at what capacity does the executor's queue cause
         // slowdowns?
-        for (int index = this.startIndex; index < this.endIndex; index++) {
-            ioExecutor.submit(new CallableDownloader(index));
-        }
-
-        for (int t = 0; t < numCpuThreads; t++) {
-            cpuExecutor.submit(
-                    () -> {
-                        while (true) {
+        ArrayList<CompletableFuture<Integer>> futures = new ArrayList<>();
+        for (int i = 0; i < this.endIndex; i++) {
+            logger.fine(String.format("Submitting %d", i));
+            final int index = i;
+            futures.add(
+                    CompletableFuture.supplyAsync(() -> {
+                        logger.fine(String.format("downloading %d", index));
+                        for (int t = 0; t < downloadRetries; t++) {
                             try {
-                                SearchParams searchParams = inMemoryFileQueue.poll(pollTimeout, TimeUnit.MILLISECONDS);
-                                if (searchParams == null) {
-                                    // Either we are waiting, or we are done.
-                                    if (this.indexesQueued.get() >= endIndex) {
-                                        // we are done
-                                        break;
-                                    }
-                                    logger.fine("Polling timed out while waiting for new indexes");
-                                } else {
-                                    int matches = this.textSearcher.countMatches(searchParams.data);
-                                    // All done - submit my results
-//                                    System.out.printf("Found  %d matches in %d%n", matches, searchParams.index);
-                                    this.addToCount(matches);
+                                // Semaphore controls number of downloaded files allowed in memory concurrently
+                                inMemoryFileSemaphore.acquire();
+                                logger.fine(String.format("semaphore acquired"));
 
-                                    inMemoryFileSemaphore.release();
-                                }
-                            } catch (InterruptedException e) {
-                                logger.warning("cpu thread interrupted");
-                                break;
+                                byte[] indexData = downloader.download(index);
+                                logger.fine(String.format("bytes downloaded"));
+
+                                return new SearchParams(index, indexData);
+                            } catch (IOException | InterruptedException |RuntimeException e) {
+                                logger.severe(String.format("Exception during download. %s", e.getMessage()));
+                                inMemoryFileSemaphore.release();
+
+                                addToExceptionCount(1);
                             }
                         }
-                    }
-
+                        return new SearchParams(index, null);
+                    }, ioExecutor).thenApplyAsync((SearchParams searchParams) -> {
+                        logger.fine(String.format("searching %d", searchParams.index));
+                        int matches = searchParams.data != null ? textSearcher.countMatches(searchParams.data) : 0;
+                        inMemoryFileSemaphore.release();
+                        return matches;
+                    }, cpuExecutor)
             );
+
         }
+
+        int count = futures.stream().mapToInt((f) -> {
+            try {
+                return f.get();
+            } catch (InterruptedException | ExecutionException e) {
+                throw new RuntimeException(e);
+            }
+        }).sum();
 
         cpuExecutor.shutdown();
         ioExecutor.shutdown();
-        try {
-            while (!cpuExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS)
-                    || !ioExecutor.awaitTermination(Long.MAX_VALUE, TimeUnit.MILLISECONDS)) {
-                logger.fine("Still waiting...");
-            }
-        } catch (InterruptedException e) {
-            logger.fine("Interrupted");
-        }
         return new Result(count, exceptionCount);
-
     }
 
-    class CallableDownloader implements Callable<Void> {
-        private final int index;
-
-        public CallableDownloader(int index) {
-            this.index = index;
-
-        }
-
-        @Override
-        public Void call() {
-            for (int t = 0; t < downloadRetries; t++) {
-                try {
-                    // Semaphore controls number of downloaded files allowed in memory concurrently
-                    inMemoryFileSemaphore.acquire();
-
-                    byte[] indexData = downloader.download(index);
-                    indexesQueued.incrementAndGet();
-                    inMemoryFileQueue.add(new SearchParams(index, indexData));
-                    return null;
-                } catch (IOException | InterruptedException e) {
-                    inMemoryFileSemaphore.release();
-
-                    addToExceptionCount(1);
-                }
-            }
-
-            return null;
-        }
-    }
     class SearchParams {
         public final int index;
         public final byte[] data;
@@ -373,5 +332,12 @@ class ParallelSearcher {
             this.index = index;
             this.data = data;
         }
+    }
+}
+
+class ThreadNameSimpleFormatter extends SimpleFormatter {
+    @Override
+    public String format(LogRecord record) {
+        return String.format("%s: %s", Thread.currentThread().getName(), super.format(record));
     }
 }
